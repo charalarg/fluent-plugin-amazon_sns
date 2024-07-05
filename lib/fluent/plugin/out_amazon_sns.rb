@@ -54,8 +54,8 @@ module Fluent::Plugin
       end
       options[:http_proxy] = @aws_proxy_uri
 
-      sns_client = Aws::SNS::Client.new(options)
-      @sns = Aws::SNS::Resource.new(client: sns_client)
+      @sns_client = Aws::SNS::Client.new(options)
+      @sns = Aws::SNS::Resource.new(client: @sns_client)
       @topics = get_topics
     end
 
@@ -77,15 +77,45 @@ module Fluent::Plugin
     end
 
     def write(chunk)
+      messages_to_send = []
+
       chunk.msgpack_each do |tag, time, record|
         record["time"] = Time.at(time).localtime
         subject = record.delete(@subject_key) || @subject  || 'Fluent-Notification'
-        topic = @topic_generator.call(tag, record)
-        topic = topic.gsub(/\./, '-') if topic # SNS doesn't allow .
-        if @topics[topic]
-          @topics[topic].publish(message: record.to_json, subject: subject)
+        @topic = @topic_generator.call(tag, record)
+        @topic = @topic.gsub(/\./, '-') if @topic # SNS doesn't allow .
+
+        if @topics[@topic]
+          messages_to_send << { message: record.to_json }
+
+          if messages_to_send.length >= 10
+            send_messages_in_batches(messages_to_send)
+            messages_to_send = []
+          end
         else
-          $log.error "Could not find topic '#{topic}' on SNS"
+          $log.error "Could not find topic on SNS"
+        end
+      end
+
+      send_messages_in_batches(messages_to_send) unless messages_to_send.empty?
+    end
+
+    def send_messages_in_batches(messages)
+      messages.each_slice(10) do |batch|
+        entries = batch.map.with_index do |msg, idx|
+          {
+            id: "#{idx + 1}",
+            message: msg[:message]
+          }
+        end
+
+        begin
+          @sns_client.publish_batch(
+            topic_arn: @topics[@topic].arn,
+            publish_batch_request_entries: entries
+          )
+        rescue StandardError => e
+          $log.error "Error while sending batch to SNS: #{e.message}"
         end
       end
     end
